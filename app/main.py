@@ -1,30 +1,32 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from typing import Dict
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional
 import pickle
 import os
 from fastapi.middleware.cors import CORSMiddleware
-
+import joblib
 
 # ---------- Config ----------
 BLOCKCHAIN_MODEL_PATH = r"C:\Users\amalj\OneDrive\Desktop\classifiers\app\models\blockchain_transaction_classifier.pkl"
-FRAUD_MODEL_PATH = r"C:\Users\amalj\OneDrive\Desktop\classifiers\app\models\lstm_model.pkl"
-LSTM_SCALER_PATH = r"C:\Users\amalj\OneDrive\Desktop\classifiers\app\models\lstm_scaler.pkl"
+
 
 
 if not os.path.exists(BLOCKCHAIN_MODEL_PATH):
     raise FileNotFoundError(f"Model not found at {BLOCKCHAIN_MODEL_PATH}")
-if not os.path.exists(FRAUD_MODEL_PATH):
-    raise FileNotFoundError(f"Fraud model not found at {FRAUD_MODEL_PATH}")
-
 with open(BLOCKCHAIN_MODEL_PATH, "rb") as f:
     classifier = pickle.load(f)
-with open(FRAUD_MODEL_PATH, "rb") as f:
-    fraud_model = pickle.load(f)
-with open(LSTM_SCALER_PATH, "rb") as f:
-    lstm_scaler = pickle.load(f)
+
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(script_dir, "models", "xgb_model.pkl")
+scaler_path = os.path.join(script_dir, "models", "scaler.pkl")
+
+xgb_model = joblib.load(model_path)
+scaler = joblib.load(scaler_path)
+
 
 # ---------- FastAPI App ----------
 app = FastAPI(
@@ -67,34 +69,109 @@ class PredictionResult(BaseModel):
     probabilities: Dict[str, float]
 
 
-class FraudDetectionFeatures(BaseModel):
-    # Match exactly what the scaler expects
-    Sent_tnx: int = Field(..., alias="Sent tnx")
-    Received_Tnx: int = Field(..., alias="Received Tnx")
-    Unique_Received_From_Addresses: int = Field(..., alias="Unique Received From Addresses")
-    Unique_Sent_To_Addresses: int = Field(..., alias="Unique Sent To Addresses")
-    total_ether_received: float = Field(..., alias="total ether received")
-    avg_val_received: float = Field(..., alias="avg val received")
-    avg_val_sent: float = Field(..., alias="avg val sent")
-    min_value_received: float = Field(..., alias="min value received")
-    max_value_received: float = Field(..., alias="max value received")
-    min_val_sent: float = Field(..., alias="min val sent")
-    max_val_sent: float = Field(..., alias="max val sent")
-    total_Ether_sent: float = Field(..., alias="total Ether sent")
-    Time_Diff_between_first_and_last_Mins: float = Field(..., alias="Time Diff between first and last (Mins)")
 
+
+# Your full features list in order - must match model training
+FEATURES_LIST = [
+    'Avg min between sent tnx', 'Avg min between received tnx', 'Time Diff between first and last (Mins)',
+    'Sent tnx', 'Received Tnx', 'Number of Created Contracts', 'Unique Received From Addresses',
+    'Unique Sent To Addresses', 'min value received', 'max value received ', 'avg val received',
+    'min val sent', 'max val sent', 'avg val sent', 'min value sent to contract', 'max val sent to contract',
+    'avg value sent to contract', 'total transactions (including tnx to create contract', 'total Ether sent',
+    'total ether received', 'total ether sent contracts', 'total ether balance', ' Total ERC20 tnxs',
+    ' ERC20 total Ether received', ' ERC20 total ether sent', ' ERC20 total Ether sent contract',
+    ' ERC20 uniq sent addr', ' ERC20 uniq rec addr', ' ERC20 uniq sent addr.1', ' ERC20 uniq rec contract addr',
+    ' ERC20 avg time between sent tnx', ' ERC20 avg time between rec tnx', ' ERC20 avg time between rec 2 tnx',
+    ' ERC20 avg time between contract tnx', ' ERC20 min val rec', ' ERC20 max val rec', ' ERC20 avg val rec',
+    ' ERC20 min val sent', ' ERC20 max val sent', ' ERC20 avg val sent', ' ERC20 min val sent contract',
+    ' ERC20 max val sent contract', ' ERC20 avg val sent contract', ' ERC20 uniq sent token name',
+    ' ERC20 uniq rec token name'
+]
+
+class Transaction(BaseModel):
+    blockNumber: str
+    blockHash: str
+    timeStamp: str
+    hash: str
+    nonce: str
+    transactionIndex: str
+    from_address: str = Field(..., alias="from")   # Accept 'from' key but use 'from_address' in model
+    to_address: str = Field(..., alias="to")       # Same for 'to'
+    value: str
+    gas: str
+    gasPrice: str
+    input: str
+    methodId: str
+    functionName: str
+    contractAddress: str
+    cumulativeGasUsed: str
+    txreceipt_status: str
+    gasUsed: str
+    confirmations: str
+    isError: str
+
+    # Use alias for JSON keys that clash with Python keywords
     class Config:
-        allow_population_by_field_name = True
-        extra = "forbid"
+        fields = {
+            'from_address': 'from'
+        }
 
-class FraudResult(BaseModel):
-    predicted_label: str
-    confidence: float
-    probabilities: Dict[str, float]
+class TransactionsPayload(BaseModel):
+    address: str
+    transactions: List[Transaction]
 
+def to_int(ts):
+    try:
+        return int(ts)
+    except:
+        return 0
+
+def compute_features(transactions: List[Transaction], target_address: str) -> pd.DataFrame:
+    target_address = target_address.lower()
+    timestamps = [to_int(tx.timeStamp) for tx in transactions]
+    timestamps_sorted = sorted(timestamps)
+
+    feature_rows = []
+
+    for tx in transactions:
+        tx_time = to_int(tx.timeStamp)
+        tx_value_eth = int(tx.value) / 1e18
+        sent = (tx.from_address.lower() == target_address)
+        received = (tx.to_address.lower() == target_address)
+
+        previous_times = [t for t in timestamps_sorted if t < tx_time]
+        next_times = [t for t in timestamps_sorted if t > tx_time]
+
+        time_since_prev = (tx_time - max(previous_times)) / 60 if previous_times else 0
+        time_to_next = (min(next_times) - tx_time) / 60 if next_times else 0
+
+        features = {
+            'Sent tnx': int(sent),
+            'Received Tnx': int(received),
+            'Time Diff between first and last (Mins)': (max(timestamps_sorted) - min(timestamps_sorted)) / 60 if len(timestamps_sorted) > 1 else 0,
+            'Avg min between sent tnx': 0,   # You can implement avg logic here if needed
+            'Avg min between received tnx': 0,
+            'min val sent': tx_value_eth if sent else 0,
+            'max val sent': tx_value_eth if sent else 0,
+            'avg val sent': tx_value_eth if sent else 0,
+            'min value received': tx_value_eth if received else 0,
+            'max value received ': tx_value_eth if received else 0,
+            'avg val received': tx_value_eth if received else 0,
+        }
+
+        # Fill missing features with 0
+        for feat in FEATURES_LIST:
+            if feat not in features:
+                features[feat] = 0
+
+        feature_rows.append(features)
+
+    df = pd.DataFrame(feature_rows)
+    df = df[FEATURES_LIST]  # reorder columns
+    return df
 
 # ---------- Blockchain Transaction Endpoints ----------
-@app.post("/predict", response_model=PredictionResult)
+@app.post("/classify", response_model=PredictionResult)
 async def predict_transaction(tx: TransactionFeatures):
     try:
         input_data = pd.DataFrame([tx.dict()])
@@ -171,51 +248,25 @@ async def get_model_info():
     }
 
 # ---------- Fraud Detection Endpoints ----------
-
-@app.post("/fraud_predict", response_model=FraudResult)
-async def fraud_predict(features: FraudDetectionFeatures):
+@app.post("/fraud_predict")
+def predict(payload: TransactionsPayload):
     try:
-        # Convert to dict with original feature names
-        input_data = features.dict(by_alias=True)
-        
-        # Create DataFrame with ALL original features (zero-filled for missing ones)
-        full_features = {name: 0 for name in lstm_scaler.feature_names_in_}
-        full_features.update(input_data)  # Override with our provided values
-        input_df = pd.DataFrame([full_features])[lstm_scaler.feature_names_in_]
-        
-        # Scale and predict
-        scaled_input = lstm_scaler.transform(input_df)
-        X_input = scaled_input.reshape((1, 1, scaled_input.shape[1]))
-        pred = fraud_model.predict(X_input)[0][0]
-
-        return {
-            "predicted_label": '1' if pred >= 0.5 else '0',
-            "confidence": float(max(pred, 1 - pred)),
-            "probabilities": {'0': 1 - pred, '1': pred}
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-
-@app.post("/fraud_batch_predict", response_model=List[FraudResult])
-async def fraud_batch_predict(features_batch: List[FraudDetectionFeatures]):
-    try:
-        df_batch = pd.DataFrame([f.dict() for f in features_batch])
-        scaled_batch = lstm_scaler.transform(df_batch)
-        X_batch = scaled_batch.reshape((len(df_batch), 1, df_batch.shape[1]))
-
-        preds = fraud_model.predict(X_batch).flatten()
+        df_features = compute_features(payload.transactions, payload.address)
+        scaled_features = scaler.transform(df_features)
+        preds = xgb_model.predict(scaled_features)
+        probs = xgb_model.predict_proba(scaled_features)
 
         results = []
-        for p in preds:
-            label = '1' if p >= 0.5 else '0'
-            proba_dict = {'0': 1 - p, '1': p}
+        for tx, pred, prob in zip(payload.transactions, preds, probs):
             results.append({
-                "predicted_label": label,
-                "confidence": float(max(p, 1 - p)),
-                "probabilities": proba_dict
+                "tx_hash": tx.hash,
+                "prediction": int(pred),
+                "probability_class_0": float(prob[0]),
+                "probability_class_1": float(prob[1]),
+                "label": "🚨 Fraudulent" if pred == 1 else "✅ Not Fraudulent"
             })
 
-        return results
+        return {"results": results}
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
