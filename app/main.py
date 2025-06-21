@@ -10,9 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import joblib
 
 # ---------- Config ----------
-BLOCKCHAIN_MODEL_PATH = r"C:\Users\amalj\OneDrive\Desktop\classifiers\app\models\blockchain_transaction_classifier.pkl"
-
-
+script_dir = os.path.dirname(os.path.abspath(__file__))
+BLOCKCHAIN_MODEL_PATH = os.path.join(script_dir, "models", "blockchain_transaction_classifier.pkl")
 
 if not os.path.exists(BLOCKCHAIN_MODEL_PATH):
     raise FileNotFoundError(f"Model not found at {BLOCKCHAIN_MODEL_PATH}")
